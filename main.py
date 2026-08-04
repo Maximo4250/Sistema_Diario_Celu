@@ -43,6 +43,7 @@ from kivy.uix.gridlayout import GridLayout
 from kivy.uix.label import Label
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.screenmanager import Screen, ScreenManager, NoTransition
+from kivy.uix.textinput import TextInput
 from kivy.uix.widget import Widget
 
 # ---------------------------------------------------------------- #
@@ -404,9 +405,76 @@ class FilaCotizacion(RoundedCard):
         self.add_widget(spark)
 
 
+class TarjetaAlerta(RoundedCard):
+    """Campo fijo (no se reconstruye en cada refresco) para configurar el
+    umbral de alerta: si algún dólar cae por debajo de este valor, la app
+    manda una notificación."""
+
+    def __init__(self, app, **kwargs):
+        super().__init__(bg=CARD_ALT, radius=14, orientation="vertical",
+                          size_hint_y=None, height=dp(120), padding=dp(14),
+                          spacing=dp(8), **kwargs)
+        self.app = app
+
+        self.add_widget(etiqueta("Avisarme si algún dólar baja de:", color=WHITE,
+                                  size=14, halign="left"))
+
+        fila = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(8))
+        self.input = TextInput(
+            text="", hint_text="Ej: 1400", input_filter="float", multiline=False,
+            halign="center", font_size=sp(16), size_hint=(0.45, 1),
+            background_color=(0.2, 0.2, 0.2, 1), foreground_color=WHITE,
+            cursor_color=GOLD, padding=[dp(10), dp(10), dp(10), dp(10)])
+        fila.add_widget(self.input)
+
+        btn_guardar = RoundedButton(text="Guardar", bg=GOLD, fg=BLACK, radius=14,
+                                     font_size=13, size_hint=(0.3, 1))
+        btn_guardar.bind(on_release=lambda *_: self.guardar())
+        fila.add_widget(btn_guardar)
+
+        btn_quitar = RoundedButton(text="Quitar", bg=CARD, fg=GREY, radius=14,
+                                    font_size=13, size_hint=(0.25, 1))
+        btn_quitar.bind(on_release=lambda *_: self.quitar())
+        fila.add_widget(btn_quitar)
+
+        self.add_widget(fila)
+
+        self.estado_lbl = etiqueta("Sin alerta configurada", color=GREY, size=12)
+        self.add_widget(self.estado_lbl)
+
+        umbral = self.app.umbral_alerta
+        if umbral is not None:
+            self.input.text = f"{umbral:g}"
+            self._mostrar_activa(umbral)
+
+    def _mostrar_activa(self, umbral):
+        self.estado_lbl.text = f"Alerta activa: por debajo de ${umbral:,.2f}"
+        self.estado_lbl.color = GOLD
+
+    def guardar(self):
+        txt = self.input.text.strip().replace(",", ".")
+        try:
+            valor = float(txt)
+            if valor <= 0:
+                raise ValueError
+        except ValueError:
+            self.estado_lbl.text = "Ingresá un número válido"
+            self.estado_lbl.color = RED
+            return
+        self.app.guardar_umbral_alerta(valor)
+        self._mostrar_activa(valor)
+
+    def quitar(self):
+        self.input.text = ""
+        self.app.guardar_umbral_alerta(None)
+        self.estado_lbl.text = "Sin alerta configurada"
+        self.estado_lbl.color = GREY
+
+
 class VistaFinanzas(Screen):
-    def __init__(self, **kwargs):
+    def __init__(self, app, **kwargs):
         super().__init__(**kwargs)
+        self.app = app
         raiz = BoxLayout(orientation="vertical", padding=dp(20), spacing=dp(14))
 
         header = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(10))
@@ -423,6 +491,11 @@ class VistaFinanzas(Screen):
         self.cuerpo.bind(minimum_height=self.cuerpo.setter("height"))
         self.scroll.add_widget(self.cuerpo)
         raiz.add_widget(self.scroll)
+
+        # Tarjeta de alerta: fija, no se reconstruye cada vez que llegan
+        # cotizaciones nuevas (así no perdés lo que estás escribiendo).
+        self.tarjeta_alerta = TarjetaAlerta(self.app)
+        raiz.add_widget(self.tarjeta_alerta)
 
         self.add_widget(raiz)
         self.mostrar_cargando()
@@ -495,12 +568,18 @@ class SistemaDiarioApp(App):
         self.store = JsonStore(self.user_data_dir + "/sistema_diario.json")
         self.historial_dolar = {casa: [] for casa, _ in TIPOS_DOLAR}
 
+        # --- alerta de precio: umbral guardado + control de "ya avisé" --- #
+        self.umbral_alerta = None
+        if self.store.exists("alerta"):
+            self.umbral_alerta = self.store.get("alerta")["umbral"]
+        self.ya_notificado = {casa: False for casa, _ in TIPOS_DOLAR}
+
         tipo_de_dia = self._definir_tipo_de_dia()
 
         self.sm = ScreenManager(transition=NoTransition())
         self.vista_hoy = VistaHoy(tipo_de_dia, name="hoy")
         self.vista_materias = VistaMaterias(name="materias")
-        self.vista_finanzas = VistaFinanzas(name="finanzas")
+        self.vista_finanzas = VistaFinanzas(self, name="finanzas")
         self.sm.add_widget(self.vista_hoy)
         self.sm.add_widget(self.vista_materias)
         self.sm.add_widget(self.vista_finanzas)
@@ -538,6 +617,41 @@ class SistemaDiarioApp(App):
             return tipo
         return int(tipo_guardado)
 
+    # ---- alerta de precio ---- #
+    def guardar_umbral_alerta(self, valor):
+        self.umbral_alerta = valor
+        if valor is None:
+            if self.store.exists("alerta"):
+                self.store.delete("alerta")
+        else:
+            self.store.put("alerta", umbral=valor)
+        # si cambiás el umbral, dejá que vuelva a avisar si corresponde
+        self.ya_notificado = {casa: False for casa, _ in TIPOS_DOLAR}
+
+    def _revisar_alertas(self, cotizaciones):
+        if self.umbral_alerta is None:
+            return
+        for casa, nombre in TIPOS_DOLAR:
+            if casa not in cotizaciones:
+                continue
+            venta = cotizaciones[casa]["venta"]
+            if venta < self.umbral_alerta:
+                if not self.ya_notificado.get(casa):
+                    self._enviar_notificacion(
+                        "Alerta de dólar",
+                        f"{nombre} bajó a ${venta:,.2f} "
+                        f"(por debajo de ${self.umbral_alerta:,.2f})")
+                    self.ya_notificado[casa] = True
+            else:
+                self.ya_notificado[casa] = False
+
+    def _enviar_notificacion(self, titulo, mensaje):
+        try:
+            from plyer import notification
+            notification.notify(title=titulo, message=mensaje, timeout=10)
+        except Exception as e:
+            print(f"No se pudo enviar la notificación: {e}")
+
     # ---- persistencia / refresco de finanzas ---- #
     def _cargar_ultimo_dato_dolar(self):
         if self.store.exists("datos_dolar"):
@@ -562,6 +676,7 @@ class SistemaDiarioApp(App):
                         del hist[:-MAX_PUNTOS_HISTORIAL]
                 self.store.put("datos_dolar", datos=cotizaciones)
                 self.vista_finanzas.pintar(cotizaciones, None, self.historial_dolar)
+                self._revisar_alertas(cotizaciones)
             else:
                 datos_previos = None
                 if self.store.exists("datos_dolar"):
