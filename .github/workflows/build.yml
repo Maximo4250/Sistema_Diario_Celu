@@ -1,24 +1,31 @@
 name: Build APK
-
+ 
 on:
   push:
     branches: [ main ]
   workflow_dispatch:
-
+ 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
+ 
+      # Copia tus archivos versionados (buildozer_1.spec, etc.) a los
+      # nombres exactos que Buildozer necesita, sin tocar tus originales.
+      - name: Preparar nombres que Buildozer necesita
+        run: |
+          cp buildozer_1.spec buildozer.spec
+ 
       - name: Build con la imagen oficial de Buildozer (Kivy)
         run: |
           docker run --rm \
             -v ${{ github.workspace }}:/home/user/hostcwd \
             kivy/buildozer android debug
-
+ 
       - name: Subir el APK como artefacto
         uses: actions/upload-artifact@v4
         with:
           name: sistema-diario-apk
           path: bin/*.apk
+ 
